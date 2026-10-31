@@ -537,10 +537,6 @@ public class Database : IDisposable
 		$"SELECT {RetroItemColumns} FROM retro_items WHERE session_id = $sid ORDER BY position", ReadRetroItem,
 		("$sid", (long)sessionId));
 
-	public void SetRetroIncluded(ulong sessionId, ulong originalId, bool included) => Execute(
-		"UPDATE retro_items SET included = $inc WHERE session_id = $sid AND original_id = $oid",
-		("$inc", included ? 1 : 0), ("$sid", (long)sessionId), ("$oid", (long)originalId));
-
 	public void SetRetroCopy(ulong sessionId, ulong originalId, ulong copyId, IEnumerable<ulong> extraCopyIds, string replyHeader) => Execute(
 		"UPDATE retro_items SET copy_id = $cid, extra_copy_ids = $extra, reply_header = $hdr WHERE session_id = $sid AND original_id = $oid",
 		("$cid", (long)copyId), ("$extra", string.Join(",", extraCopyIds)), ("$hdr", replyHeader),

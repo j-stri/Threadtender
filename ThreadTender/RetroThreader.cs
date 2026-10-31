@@ -8,7 +8,7 @@ namespace ThreadTender;
 
 /// <summary>
 /// Retroactive threading: pull a conversation that already happened in an UNMANAGED
-/// channel into a new thread. Flow — pick a name and anchor, untick strays, stage
+/// channel into a new thread. Flow — pick a name, the first message and the last, stage
 /// webhook copies into a review thread, let reviewers ❌ unwanted copies, then Finalize,
 /// which is the ONLY step that deletes anything from the channel. Cancel or expiry
 /// deletes the staging thread and leaves the channel exactly as it was.
@@ -17,22 +17,29 @@ namespace ThreadTender;
 /// is confirmed to exist; a copy whose original its author deleted never survives; every
 /// step resumes safely after a restart.
 ///
-/// Custom IDs (prefix ttr): name (modal), anchor / older (anchor pager), pick (untick
-/// menus), stage, fin, cxl. Wizard state lives in retro_sessions / retro_items rather
-/// than in the IDs: a thread name can be as long as a custom ID itself.
+/// Custom IDs (prefix ttr): name (modal), anchor / older (anchor pager), end / endlatest /
+/// change (end point), stage, fin, cxl. Wizard state lives in retro_sessions /
+/// retro_items rather than in the IDs: a thread name can be as long as a custom ID itself.
 /// </summary>
 public class RetroThreader(BotConfig config, Database db, ThreadImporter importer, Transposer transposer)
 {
 	public const string ContextMenuName = "Thread from here";
+	public const string EndMenuName = "Thread end here";
 	private const string SlashName = "thread";
-	private const int MaxItems = 100, PageSize = 25, AnchorFetch = 60;
+	private const int MaxItems = 100, PageSize = 25, AnchorFetch = 60, RangeFetch = 300;
 	private static readonly TimeSpan DraftLife = TimeSpan.FromMinutes(15); // = interaction token life
-	private const string KeepEmoji = "✅", DropEmoji = "❌";
+	private const string DropEmoji = "❌";
+	private const string LegacyKeepEmoji = "✅"; // seeded by early builds; only ever removed now
 
 	private readonly ConcurrentDictionary<ulong, SemaphoreSlim> sessionLocks = new();
 	private SemaphoreSlim LockFor(ulong sessionId) => sessionLocks.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
 
 	private bool maintenanceStarted;
+
+	// Session → the interaction whose ephemeral reply currently shows its wizard, so a
+	// superseded wizard (a newer draft, or "Thread end here" continuing elsewhere) can
+	// be cleared. In memory only: the tokens live 15 minutes, the same as a draft.
+	private readonly ConcurrentDictionary<ulong, DiscordInteraction> wizards = new();
 
 	// Finalize retries back off (1, 2, 4 … 60 minutes) so a persistent failure — a lost
 	// permission, say — doesn't hammer Discord every minute forever.
@@ -43,6 +50,7 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 	[
 		new(SlashName, "Pull a conversation that already happened into a new thread.", allowDMUsage: false),
 		new(ContextMenuName, "", type: DiscordApplicationCommandType.MessageContextMenu, allowDMUsage: false),
+		new(EndMenuName, "", type: DiscordApplicationCommandType.MessageContextMenu, allowDMUsage: false),
 	];
 
 	// ================================================================ entry points
@@ -53,7 +61,7 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 		if (interaction.Type != DiscordInteractionType.ApplicationCommand)
 			return;
 		string name = interaction.Data.Name;
-		if (name != SlashName && name != ContextMenuName)
+		if (name != SlashName && name != ContextMenuName && name != EndMenuName)
 			return;
 
 		Console.WriteLine($"[ThreadTender] Retro: {name} from {interaction.User.Username}.");
@@ -62,6 +70,12 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 		if (refusal is not null)
 		{
 			await RespondEphemeralAsync(interaction, refusal);
+			return;
+		}
+
+		if (name == EndMenuName)
+		{
+			await HandleEndMenuAsync(client, interaction);
 			return;
 		}
 
@@ -90,6 +104,40 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 		await interaction.CreateResponseAsync(DiscordInteractionResponseType.Modal, modal);
 	}
 
+	/// <summary>
+	/// "Thread end here": sets the end of the caller's open draft in this channel. It
+	/// arrives as a brand-new interaction, so it's matched to the draft by (person,
+	/// channel); its reply becomes the live wizard and the earlier one is retired.
+	/// </summary>
+	private async Task HandleEndMenuAsync(DiscordClient client, DiscordInteraction interaction)
+	{
+		DiscordMessage? end = interaction.Data.Resolved?.Messages?.Values.FirstOrDefault();
+		RetroSession? draft = OpenDraftsFor(interaction.Guild!.Id, interaction.ChannelId, interaction.User.Id)
+			.Where(s => s.AnchorId != 0)
+			.OrderByDescending(s => s.SessionId)
+			.FirstOrDefault();
+
+		if (end is null || draft is null)
+		{
+			await RespondEphemeralAsync(interaction,
+				$"Start with **{ContextMenuName}** (right-click → Apps) on the conversation's first message — or pick it in your /thread wizard — " +
+				$"then use **{EndMenuName}** on its last.");
+			return;
+		}
+		if (end.Id <= draft.AnchorId)
+		{
+			await RespondEphemeralAsync(interaction, "That message comes before the thread's first message — pick one after it.");
+			return;
+		}
+
+		await interaction.CreateResponseAsync(DiscordInteractionResponseType.DeferredChannelMessageWithSource,
+			new DiscordInteractionResponseBuilder().AsEphemeral());
+		DiscordChannel channel = await client.GetChannelAsync(draft.ChannelId);
+		await interaction.EditOriginalResponseAsync(await BuildRangeAsync(channel, draft, end.Id));
+		await RetireWizardAsync(draft.SessionId, "Continued in the newer message below.");
+		wizards[draft.SessionId] = interaction;
+	}
+
 	public async Task HandleModalAsync(DiscordClient client, ModalSubmittedEventArgs e)
 	{
 		string[] parts = e.Id.Split(':');
@@ -116,15 +164,23 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 			return;
 		}
 
+		// One open draft per person per channel, so "Thread end here" is never ambiguous.
+		foreach (RetroSession old in OpenDraftsFor(e.Interaction.Guild!.Id, e.Interaction.ChannelId, e.Interaction.User.Id))
+		{
+			await CancelSessionAsync(client, old.SessionId, reason: null);
+			await RetireWizardAsync(old.SessionId, "Replaced by your newer import.");
+		}
+
 		RetroSession session = new(e.Interaction.Id, e.Interaction.Guild!.Id, e.Interaction.ChannelId, ulong.Parse(anchorText),
 			e.Interaction.User.Id, threadName[..Math.Min(threadName.Length, 100)], 0, 0, 0, "drafting", false, "",
 			DateTimeOffset.UtcNow + DraftLife);
 		db.UpsertRetroSession(session);
+		wizards[session.SessionId] = e.Interaction;
 
 		DiscordChannel channel = await client.GetChannelAsync(session.ChannelId);
 		DiscordWebhookBuilder page = session.AnchorId == 0
 			? await BuildAnchorPageAsync(channel, session, before: null)
-			: await BuildUntickAsync(channel, session);
+			: await BuildEndPageAsync(channel, session);
 		await e.Interaction.EditOriginalResponseAsync(page);
 	}
 
@@ -169,26 +225,23 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 				if (updated is null)
 					return;
 				DiscordChannel channel = await client.GetChannelAsync(updated.ChannelId);
-				await e.Interaction.EditOriginalResponseAsync(await BuildUntickAsync(channel, updated));
+				await e.Interaction.EditOriginalResponseAsync(await BuildEndPageAsync(channel, updated));
 				return;
 			}
 
-			case "pick" when parts.Length == 4:
+			case "end" or "endlatest" or "change":
 			{
-				// Each menu reports its own full selection; store it for Stage to read.
-				// No visible update: the client keeps the user's ticks on its own.
 				await e.Interaction.CreateResponseAsync(DiscordInteractionResponseType.DeferredMessageUpdate);
-				int page = int.Parse(parts[3]);
-				HashSet<ulong> ticked = [.. e.Values.Select(ulong.Parse)];
-				await WithLockAsync(sessionId, () =>
+				if (session.Status != "drafting")
+					return;
+				DiscordChannel channel = await client.GetChannelAsync(session.ChannelId);
+				DiscordWebhookBuilder page = parts[1] switch
 				{
-					// Under the lock: a late pick racing Stage must not change items that
-					// staging has already started copying.
-					if (db.GetRetroSession(sessionId) is { Status: "drafting" })
-						foreach (RetroItem item in db.GetRetroItems(sessionId).Skip(page * PageSize).Take(PageSize))
-							db.SetRetroIncluded(sessionId, item.OriginalId, ticked.Contains(item.OriginalId));
-					return Task.CompletedTask;
-				});
+					"end" => await BuildRangeAsync(channel, session, ulong.Parse(e.Values[0])),
+					"endlatest" => await BuildRangeAsync(channel, session, endId: null),
+					_ => await BuildEndPageAsync(channel, session),
+				};
+				await e.Interaction.EditOriginalResponseAsync(page);
 				return;
 			}
 
@@ -231,6 +284,37 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 				}
 				return;
 		}
+	}
+
+	/// <summary>
+	/// Stores a draft's range, under the lock and only while still drafting — a late
+	/// end-pick must never rewrite items that Stage has already claimed.
+	/// </summary>
+	private async Task<bool> StoreRangeAsync(ulong sessionId, List<RetroItem> items)
+	{
+		bool stored = false;
+		await WithLockAsync(sessionId, () =>
+		{
+			if (db.GetRetroSession(sessionId) is { Status: "drafting" })
+			{
+				db.ReplaceRetroItems(sessionId, items);
+				stored = true;
+			}
+			return Task.CompletedTask;
+		});
+		return stored;
+	}
+
+	private IEnumerable<RetroSession> OpenDraftsFor(ulong guildId, ulong channelId, ulong userId) =>
+		db.GetActiveRetroSessions().Where(s => s.Status == "drafting" && s.GuildId == guildId && s.ChannelId == channelId && s.InvokerId == userId);
+
+	/// <summary>Clears a superseded wizard message (best effort: its token may have lapsed).</summary>
+	private async Task RetireWizardAsync(ulong sessionId, string note)
+	{
+		if (!wizards.TryRemove(sessionId, out DiscordInteraction? old))
+			return;
+		try { await old.EditOriginalResponseAsync(new DiscordWebhookBuilder().WithContent(note)); }
+		catch (Exception) { }
 	}
 
 	// ================================================================ gating
@@ -308,23 +392,85 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 		return builder;
 	}
 
-	/// <summary>Loads the (at most 100) human messages after the anchor, stores them as ticked items, and renders the untick menus.</summary>
-	private async Task<DiscordWebhookBuilder> BuildUntickAsync(DiscordChannel channel, RetroSession session)
+	/// <summary>Human messages after the anchor, oldest first — enough of them to tell "fits" from "too long".</summary>
+	private static async Task<List<DiscordMessage>> HumansAfterAsync(DiscordChannel channel, ulong anchorId)
+	{
+		List<DiscordMessage> after = [];
+		await foreach (DiscordMessage m in channel.GetMessagesAfterAsync(anchorId, RangeFetch))
+			after.Add(m);
+		return [.. after.Where(IsHumanMessage).OrderBy(m => m.Id)];
+	}
+
+	/// <summary>Step two: where does the conversation end? One click for "through the latest", a pick, or a right-click.</summary>
+	private static async Task<DiscordWebhookBuilder> BuildEndPageAsync(DiscordChannel channel, RetroSession session)
 	{
 		DiscordMessage? anchor = await ThreadImporter.FetchFreshAsync(channel, session.AnchorId);
 		if (anchor is null)
 			return new DiscordWebhookBuilder().WithContent("That message no longer exists — run the command again.");
 
-		List<DiscordMessage> after = [];
-		await foreach (DiscordMessage m in channel.GetMessagesAfterAsync(session.AnchorId, MaxItems))
-			after.Add(m);
+		List<DiscordMessage> humans = await HumansAfterAsync(channel, session.AnchorId);
+		DiscordButtonComponent cancel = new(DiscordButtonStyle.Secondary, $"ttr:cxl:{session.SessionId}", "Cancel");
+		if (humans.Count == 0)
+		{
+			return new DiscordWebhookBuilder()
+				.WithContent($"There are no messages from people after {anchor.JumpLink}, so there's nothing to move.")
+				.AddActionRowComponent(cancel);
+		}
 
-		HashSet<ulong> claimed = db.ClaimedByActiveRetroSessions(after.Select(m => m.Id), session.SessionId);
-		List<DiscordMessage> candidates = [.. after
-			.Where(IsHumanMessage)
-			.Where(m => !claimed.Contains(m.Id) && db.GetTransposedThread(m.Id) is null)
-			.OrderBy(m => m.Id)
-			.Take(MaxItems)];
+		// The range is capped, so only the first MaxItems messages can end it; offer the
+		// newest of those (the usual end of a conversation is near the bottom).
+		bool tooMany = humans.Count > MaxItems;
+		List<DiscordMessage> ends = [.. humans.Take(MaxItems).Reverse().Take(PageSize)];
+
+		string content =
+			$"**{session.ThreadName}**, starting at {anchor.JumpLink}.\n" +
+			"Where does the conversation end? Use **Through the latest message**, pick its last message below, " +
+			$"or right-click the last message → **Apps → {EndMenuName}**.";
+		if (tooMany)
+			content += $"\nThere are more than {MaxItems} messages after the start, so it has to end by the {MaxItems}th — or start later.";
+
+		return new DiscordWebhookBuilder()
+			.WithContent(content)
+			.AddActionRowComponent(new DiscordSelectComponent($"ttr:end:{session.SessionId}", "Pick the last message…",
+				ends.Select(m => new DiscordSelectComponentOption(Label(m), m.Id.ToString(), $"{m.Timestamp:MMM d, HH:mm} UTC")).ToList()))
+			.AddActionRowComponent(
+				new DiscordButtonComponent(DiscordButtonStyle.Primary, $"ttr:endlatest:{session.SessionId}",
+					tooMany ? $"Through the latest (over {MaxItems})" : "Through the latest message", disabled: tooMany),
+				cancel);
+	}
+
+	/// <summary>
+	/// Step three: the range from the anchor through <paramref name="endId"/> (null = the
+	/// latest message), stored as items and previewed. Strays inside the range aren't
+	/// picked out here — they get a ❌ in the review thread, with full context.
+	/// </summary>
+	private async Task<DiscordWebhookBuilder> BuildRangeAsync(DiscordChannel channel, RetroSession session, ulong? endId)
+	{
+		DiscordMessage? anchor = await ThreadImporter.FetchFreshAsync(channel, session.AnchorId);
+		if (anchor is null)
+			return new DiscordWebhookBuilder().WithContent("The first message no longer exists — run the command again.");
+
+		DiscordButtonComponent change = new(DiscordButtonStyle.Secondary, $"ttr:change:{session.SessionId}", "Change end");
+		DiscordButtonComponent cancel = new(DiscordButtonStyle.Secondary, $"ttr:cxl:{session.SessionId}", "Cancel");
+
+		List<DiscordMessage> range = [.. (await HumansAfterAsync(channel, session.AnchorId)).Where(m => endId is not { } end || m.Id <= end)];
+		if (range.Count > MaxItems)
+		{
+			await StoreRangeAsync(session.SessionId, []);
+			return new DiscordWebhookBuilder()
+				.WithContent($"That range holds {range.Count} messages; the limit is {MaxItems}. Pick an earlier end, or start the thread later.")
+				.AddActionRowComponent(change, cancel);
+		}
+
+		HashSet<ulong> claimed = db.ClaimedByActiveRetroSessions(range.Select(m => m.Id), session.SessionId);
+		List<DiscordMessage> candidates = [.. range.Where(m => !claimed.Contains(m.Id) && db.GetTransposedThread(m.Id) is null)];
+		if (candidates.Count == 0)
+		{
+			await StoreRangeAsync(session.SessionId, []);
+			return new DiscordWebhookBuilder()
+				.WithContent("Nothing in that range can be moved — there are no messages from people in it, or they're already part of another import.")
+				.AddActionRowComponent(change, cancel);
+		}
 
 		// Resolve each message's effective author now (debug masquerades included), so
 		// copies and the Finalize ping credit the right person.
@@ -334,36 +480,19 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 			(EffectiveAuthor author, string? _) = await Masquerade.ResolveAsync(config, m);
 			items.Add(new RetroItem(session.SessionId, m.Id, position, author.Id, author.NameOverride ?? "", true, 0, "pending", "", ""));
 		}
-		db.ReplaceRetroItems(session.SessionId, items);
+		if (!await StoreRangeAsync(session.SessionId, items))
+			return new DiscordWebhookBuilder().WithContent("This import has already moved on (staged or cancelled).");
 
-		DiscordWebhookBuilder builder = new();
-		if (items.Count == 0)
-		{
-			return builder
-				.WithContent($"Nothing after {anchor.JumpLink} can be moved — there are no messages from people after it, or they're already part of another import.")
-				.AddActionRowComponent(new DiscordButtonComponent(DiscordButtonStyle.Secondary, $"ttr:cxl:{session.SessionId}", "Cancel"));
-		}
-
-		string skipped = claimed.Count > 0 ? $" {claimed.Count} message(s) already in another import were left out." : "";
-		builder.WithContent(
-			$"**{session.ThreadName}**, starting at {anchor.JumpLink}.\n" +
-			$"These {items.Count} message(s) will be copied into the thread. Untick anything that doesn't belong, then press **Stage thread**. " +
-			$"Nothing is removed from the channel until the thread is reviewed and finalized.{skipped}");
-
-		for (int page = 0; page * PageSize < candidates.Count; page++)
-		{
-			List<DiscordMessage> chunk = [.. candidates.Skip(page * PageSize).Take(PageSize)];
-			builder.AddActionRowComponent(new DiscordSelectComponent(
-				$"ttr:pick:{session.SessionId}:{page}",
-				$"Messages {page * PageSize + 1}–{page * PageSize + chunk.Count}",
-				chunk.Select(m => new DiscordSelectComponentOption(Label(m), m.Id.ToString(), $"{m.Timestamp:MMM d, HH:mm} UTC", isDefault: true)).ToList(),
-				disabled: false, minOptions: 0, maxOptions: chunk.Count));
-		}
-
-		builder.AddActionRowComponent(
-			new DiscordButtonComponent(DiscordButtonStyle.Success, $"ttr:stage:{session.SessionId}", "Stage thread"),
-			new DiscordButtonComponent(DiscordButtonStyle.Secondary, $"ttr:cxl:{session.SessionId}", "Cancel"));
-		return builder;
+		string skipped = claimed.Count > 0 ? $"\n{claimed.Count} message(s) already in another import were left out." : "";
+		return new DiscordWebhookBuilder()
+			.WithContent(
+				$"**{session.ThreadName}** — **{items.Count}** message(s) after {anchor.JumpLink}, through {candidates[^1].JumpLink}.\n" +
+				$"-# first: {Label(candidates[0])}\n-# last: {Label(candidates[^1])}\n" +
+				"Unrelated messages in between can be dropped with ❌ once the thread is staged. " +
+				$"Nothing is removed from the channel until it's finalized.{skipped}")
+			.AddActionRowComponent(
+				new DiscordButtonComponent(DiscordButtonStyle.Success, $"ttr:stage:{session.SessionId}", "Stage thread"),
+				change, cancel);
 	}
 
 	// ================================================================ staging
@@ -378,7 +507,7 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 				return Task.CompletedTask; // double-click, expiry, or already staged
 			if (!db.GetRetroItems(sessionId).Any(i => i.Included))
 			{
-				problem = "Everything is unticked, so there's nothing to move. Tick at least one message, or cancel.";
+				problem = "Pick where the conversation ends first (or the range had nothing to move).";
 				return Task.CompletedTask;
 			}
 			claimed = db.UpdateRetroSessionIf(session with
@@ -404,6 +533,7 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 			  "the first message may have been deleted, or I may be missing permissions.)";
 		try { await interaction.EditOriginalResponseAsync(new DiscordWebhookBuilder().WithContent(outcome)); }
 		catch (Exception) { } // staging can outlive the 15-minute interaction token
+		wizards.TryRemove(sessionId, out _);
 	}
 
 	/// <summary>Runs (or resumes) staging; on any failure, cancels so nothing is left half-built. Returns the thread ID, or null if the session didn't make it to review.</summary>
@@ -618,24 +748,26 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 		.WithContent(
 			$"**Retroactive thread — review before it's final.** {count} message(s) copied from <#{session.ChannelId}>, " +
 			$"starting at https://discord.com/channels/{session.GuildId}/{session.ChannelId}/{session.AnchorId}.\n" +
-			$"React {DropEmoji} on a copy to drop it (its original stays in the channel); {KeepEmoji} just marks it as checked. " +
-			$"Nothing leaves <#{session.ChannelId}> until someone presses **Finalize**; unreviewed copies count as kept. " +
+			$"React {DropEmoji} on a copy to drop it (its original stays in the channel). Anything not dropped moves. " +
+			$"Nothing leaves <#{session.ChannelId}> until someone presses **Finalize** at the bottom of the thread. " +
 			$"If nobody finalizes by <t:{session.ExpiresAt.ToUnixTimeSeconds()}:f>, the import is cancelled and this thread deleted.")
 		.AddActionRowComponent(
-			new DiscordButtonComponent(DiscordButtonStyle.Success, $"ttr:fin:{session.SessionId}", "Finalize now"),
+			// Finalize lives on the confirm message at the bottom; the header only offers a
+			// way out, which matters most while staging is still running.
 			new DiscordButtonComponent(DiscordButtonStyle.Danger, $"ttr:cxl:{session.SessionId}", "Cancel import"));
 
-	/// <summary>Adds whichever of the bot's ✅/❌ controls are missing (idempotent — used on fresh copies and on resume).</summary>
+	/// <summary>Adds the bot's ❌ control if it's missing (idempotent — used on fresh copies and on resume).</summary>
 	private static async Task SeedControlsAsync(DiscordMessage copy)
 	{
-		foreach (string emoji in new[] { KeepEmoji, DropEmoji })
+		if (copy.Reactions?.Any(r => r.IsMe && r.Emoji.Name == DropEmoji) == true)
+			return;
+		try
 		{
-			if (copy.Reactions?.Any(r => r.IsMe && r.Emoji.Name == emoji) == true)
-				continue;
-			try { await copy.CreateReactionAsync(DiscordEmoji.FromUnicode(emoji)); }
-			catch (NotFoundException) { return; }
-			await Task.Delay(325); // reaction rate limit (~1 per 300 ms per channel)
+			if (!await ThreadImporter.ReactAsync(copy, DiscordEmoji.FromUnicode(DropEmoji)))
+				Console.WriteLine($"[ThreadTender] Retro: couldn't seed {DropEmoji} on copy {copy.Id} (rate limited); reacting by hand still works.");
 		}
+		catch (NotFoundException) { return; }
+		await Task.Delay(325); // reaction rate limit (~1 per 300 ms per channel)
 	}
 
 	// ================================================================ review
@@ -644,8 +776,7 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 	{
 		if (e.User.IsBot)
 			return;
-		string emoji = e.Emoji.Name;
-		if (emoji != KeepEmoji && emoji != DropEmoji)
+		if (e.Emoji.Name != DropEmoji)
 			return;
 		if (db.FindRetroItemByCopy(e.Message.Id) is not { } found)
 			return;
@@ -660,21 +791,10 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 			if (item is null || item.Verdict == "drop")
 				return;
 
-			if (emoji == DropEmoji)
-			{
-				// ❌ wins outright: the copy goes at once, the original stays in the channel.
-				db.SetRetroVerdict(item.SessionId, item.OriginalId, "drop");
-				if (await client.GetChannelAsync(session.ThreadId) is DiscordThreadChannel thread)
-					await DeleteCopyAsync(thread, item);
-			}
-			else if (item.Verdict == "pending")
-			{
-				db.SetRetroVerdict(item.SessionId, item.OriginalId, "keep");
-			}
-			else
-			{
-				return;
-			}
+			// ❌: the copy goes at once, the original stays in the channel.
+			db.SetRetroVerdict(item.SessionId, item.OriginalId, "drop");
+			if (await client.GetChannelAsync(session.ThreadId) is DiscordThreadChannel thread)
+				await DeleteCopyAsync(thread, item);
 			await MaybeConfirmAsync(client, item.SessionId);
 		});
 	}
@@ -726,21 +846,20 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 	}
 
 	/// <summary>
-	/// Once every staged copy has a verdict, posts the "does this look good?" message;
-	/// if it's already up, refreshes its counts. Caller holds the session lock.
+	/// Posts the "does this look good?" message at the bottom of the thread once staging
+	/// is done (there's no per-copy "reviewed" signal to wait for — anything not ❌'d
+	/// moves), or refreshes its counts if it's already up. Caller holds the session lock.
 	/// </summary>
 	private async Task MaybeConfirmAsync(DiscordClient client, ulong sessionId)
 	{
 		if (db.GetRetroSession(sessionId) is not { Status: "reviewing" or "confirming" } session)
 			return;
 		List<RetroItem> staged = [.. db.GetRetroItems(sessionId).Where(i => i.Included && (i.CopyId != 0 || i.Verdict == "drop"))];
-		if (staged.Any(i => i.Verdict == "pending"))
-			return;
 
-		int kept = staged.Count(i => i.Verdict == "keep"), dropped = staged.Count(i => i.Verdict == "drop");
+		int dropped = staged.Count(i => i.Verdict == "drop"), kept = staged.Count - dropped;
 		string text = kept > 0
-			? $"All {staged.Count} copies reviewed: **{kept}** kept, **{dropped}** dropped. **Does this look good?** " +
-			  $"Finalize deletes the {kept} kept original(s) from <#{session.ChannelId}> and makes this thread permanent."
+			? $"**{kept}** of {staged.Count} copies will move" + (dropped > 0 ? $" ({dropped} dropped)" : "") + ". " +
+			  $"**Does this look good?** Finalize deletes those {kept} original(s) from <#{session.ChannelId}> and makes this thread permanent."
 			: "Every copy was dropped, so there's nothing to move. Cancel to delete this thread (Finalize does the same).";
 
 		if (await client.GetChannelAsync(session.ThreadId) is not DiscordThreadChannel thread)
@@ -896,8 +1015,16 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 				continue;
 			}
 
-			try { await copy.DeleteAllReactionsAsync("ThreadTender: review finished"); }
-			catch (NotFoundException) { }
+			// Remove only the bot's own review control(s); reactions people added to the
+			// copy during review are real and stay. The echo then adds only emoji the
+			// original had that the copy doesn't already carry.
+			foreach (string control in new[] { DropEmoji, LegacyKeepEmoji })
+			{
+				if (copy.Reactions?.Any(r => r.IsMe && r.Emoji.Name == control) != true)
+					continue;
+				try { await copy.DeleteOwnReactionAsync(DiscordEmoji.FromUnicode(control)); }
+				catch (NotFoundException) { }
+			}
 			await ThreadImporter.EchoReactionsAsync(original, copy);
 
 			// A copy that couldn't re-upload every attachment links to the original's
@@ -1095,6 +1222,7 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 				catch (NotFoundException) { }
 			}
 			db.CloseRetroSession(sessionId, "cancelled");
+			wizards.TryRemove(sessionId, out _);
 			Console.WriteLine($"[ThreadTender] Retro session {sessionId} cancelled{(reason is null ? "" : $": {reason}")}.");
 			return true;
 		}
@@ -1205,8 +1333,7 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 
 	/// <summary>
 	/// Reactions sent while the bot was down never arrive as events, so reread each
-	/// unsettled copy: anyone's ❌ beyond the bot's own drops it (even one already ✅'d —
-	/// ❌ always wins), ✅ keeps a pending one.
+	/// unsettled copy: anyone's ❌ beyond the bot's own drops it.
 	/// </summary>
 	private async Task CatchUpVerdictsAsync(DiscordClient client, RetroSession session)
 	{
@@ -1227,10 +1354,6 @@ public class RetroThreader(BotConfig config, Database db, ThreadImporter importe
 				{
 					db.SetRetroVerdict(session.SessionId, item.OriginalId, "drop");
 					await DeleteCopyAsync(thread, item);
-				}
-				else if (item.Verdict == "pending" && OthersReacted(copy, KeepEmoji))
-				{
-					db.SetRetroVerdict(session.SessionId, item.OriginalId, "keep");
 				}
 			}
 			await MaybeConfirmAsync(client, session.SessionId);

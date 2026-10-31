@@ -72,24 +72,59 @@ public class ThreadImporter(BotConfig config, Transposer transposer, string data
 		if (original.Reactions is not { Count: > 0 })
 			return;
 
+		// An emoji people already put on the copy itself (e.g. during a retro review) is
+		// left alone — the bot adding one more would only inflate that real count.
+		List<DiscordEmoji> missing = [.. original.Reactions
+			.Select(r => r.Emoji)
+			.Where(e => copy.Reactions?.Any(c => c.Count > 0 && SameEmoji(c.Emoji, e)) != true)];
+		if (missing.Count == 0)
+			return;
+
 		Console.WriteLine(
-			$"[ThreadTender] Echoing {original.Reactions.Count} reaction(s) from {original.Id}: " +
-			string.Join(" ", original.Reactions.Select(r => r.Emoji.ToString())));
-		foreach (DiscordReaction reaction in original.Reactions)
+			$"[ThreadTender] Echoing {missing.Count} reaction(s) from {original.Id}: " +
+			string.Join(" ", missing.Select(e => e.ToString())));
+		foreach (DiscordEmoji emoji in missing)
 		{
 			try
 			{
-				await copy.CreateReactionAsync(reaction.Emoji);
+				if (!await ReactAsync(copy, emoji))
+					Console.WriteLine($"[ThreadTender] Reaction echo {emoji} on copy {copy.Id} gave up after repeated rate limits.");
 			}
 			catch (Exception ex)
 			{
-				Console.WriteLine($"[ThreadTender] Reaction echo {reaction.Emoji} failed on copy {copy.Id}: {ex.GetType().Name}: {ex.Message}");
+				Console.WriteLine($"[ThreadTender] Reaction echo {emoji} failed on copy {copy.Id}: {ex.GetType().Name}: {ex.Message}");
 			}
 			// Discord's reaction rate limit is ~1 per 300ms per channel and uses its own
-			// bucket; explicit spacing keeps echoes from tripping 429s.
+			// bucket; explicit spacing keeps echoes from tripping 429s in the first place.
 			await Task.Delay(325);
 		}
 	}
+
+	/// <summary>
+	/// Adds the bot's reaction, waiting out and retrying 429s: on the reactions route the
+	/// library surfaces a rate limit as RateLimitException instead of queueing the call.
+	/// Returns false only if every attempt was rate limited.
+	/// </summary>
+	public static async Task<bool> ReactAsync(DiscordMessage message, DiscordEmoji emoji)
+	{
+		for (int attempt = 1; attempt <= 5; attempt++)
+		{
+			try
+			{
+				await message.CreateReactionAsync(emoji);
+				return true;
+			}
+			catch (RateLimitException ex)
+			{
+				TimeSpan wait = ex.RetryAfter is { } after && after > TimeSpan.Zero ? after : TimeSpan.FromSeconds(attempt);
+				await Task.Delay(wait + TimeSpan.FromMilliseconds(250));
+			}
+		}
+		return false;
+	}
+
+	public static bool SameEmoji(DiscordEmoji a, DiscordEmoji b) =>
+		a.Id != 0 || b.Id != 0 ? a.Id == b.Id : a.Name == b.Name;
 
 	/// <summary>One mass ping so everyone whose messages moved knows where the conversation went.</summary>
 	public static async Task PingMovedAuthorsAsync(DiscordThreadChannel thread, IReadOnlyCollection<(ulong Id, string? Name)> authors)

@@ -76,20 +76,24 @@ it into one after the fact: right-click the message that started it and choose
 **Apps → Thread from here**, or run **/thread** and pick that message from a list.
 
 1. Name the thread (prefilled from the first message when you right-clicked it).
-2. Every human message after it (up to 100) is listed, all ticked. Untick the
-   unrelated chatter and press **Stage thread**.
+2. Say where the conversation ends: **Through the latest message** (one click — the
+   usual case), pick its last message from a list, or right-click that message and
+   choose **Apps → Thread end here**. A preview shows the range (up to 100
+   messages from people); press **Stage thread**. Unrelated chatter inside the range
+   isn't picked out here — it gets a ❌ in the next step, where you can see it properly.
 3. The bot creates the thread on that first message and posts webhook copies of the
-   ticked messages, in order and under their authors' names, with reply chains
+   messages in the range, in order and under their authors' names, with reply chains
    recreated as link headers. (If the first message already has a thread, the import
    gets its own standalone thread instead, opened by a copy of that message.)
 4. **Review:** anyone can react ❌ on a copy to drop it — the copy disappears and its
-   original stays in the channel. ✅ just marks a copy as checked. Once every copy has
-   been looked at, a **"Does this look good?"** message appears.
-5. **Finalize** (from that message, or **Finalize now** on the thread's header) deletes
-   the kept originals from the channel, swaps the review reactions for an echo of each
-   original's reactions, and pings the moved authors once. **Nothing leaves the
-   channel before Finalize** — Cancel, or the review window running out (24 hours by
-   default), deletes the staging thread and leaves the channel exactly as it was.
+   original stays in the channel. Anything not dropped moves. A **"Does this look
+   good?"** message at the bottom of the thread keeps a live count.
+5. **Finalize** (on that message) deletes the kept originals from the channel, removes
+   the bot's ❌ controls, echoes each original's reactions onto its copy, and pings the
+   moved authors once. Reactions people added to copies during review are kept as they
+   are. **Nothing leaves the channel before Finalize** — Cancel, or the review window
+   running out (24 hours by default), deletes the staging thread and leaves the channel
+   exactly as it was.
 
 Finalize double-checks everything before deleting: a copy whose original its author
 deleted is removed too; a message edited during review has its copy updated (or, if
