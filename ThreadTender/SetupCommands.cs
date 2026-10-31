@@ -11,7 +11,7 @@ namespace ThreadTender;
 /// component-driven, and stateless — wizard state rides in the component custom IDs
 /// (prefixes: ttb = bind wizard, tte = edit binding, ttu = unbind, ttg = globals).
 /// </summary>
-public class SetupCommands(BotConfig config, Database db, OrphanManager orphans, FlexThreader flex)
+public class SetupCommands(BotConfig config, Database db, OrphanManager orphans, FlexThreader flex, RetroThreader retro)
 {
 	private static readonly ChannelMode[] AllModes = [ChannelMode.PureThread, ChannelMode.ReplyOnly, ChannelMode.FlexThread];
 
@@ -27,11 +27,14 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 	/// <summary>Registers the setup commands in one guild — also invoked live when the bot joins a new server.</summary>
 	public async Task RegisterGuildAsync(DiscordGuild guild)
 	{
+		// Bulk overwrite replaces the guild's whole command set, so every feature's
+		// commands go up together: the admin commands plus retroactive threading's.
 		DiscordApplicationCommand[] commands =
 		[
 			Command("bind", "Set up ThreadTender on a channel, or edit an existing binding."),
 			Command("unbind", "Remove ThreadTender from a channel."),
 			Command("botsettings", "View and edit ThreadTender settings for this server."),
+			.. RetroThreader.Commands(),
 		];
 		await guild.BulkOverwriteApplicationCommandsAsync(commands);
 		Console.WriteLine($"[ThreadTender] Registered setup commands in \"{guild.Name}\" ({guild.Id}).");
@@ -112,7 +115,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 			case "ttb": await HandleBindComponentAsync(client, e, parts); break;
 			case "tte": await HandleEditComponentAsync(client, e, parts); break;
 			case "ttu": await HandleUnbindComponentAsync(client, e, parts); break;
-			case "ttg": await HandleGlobalsComponentAsync(e, parts); break;
+			case "ttg": await HandleGlobalsComponentAsync(client, e, parts); break;
 		}
 	}
 
@@ -391,6 +394,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 		("max_attachment_bytes", "Max attachment size (bytes)", "Attachments bigger than this become links instead of re-uploads"),
 		("search_depth", "Search depth", "How many recent messages are scanned for candidates / fuzzy search"),
 		("fuzzy_threshold", "Fuzzy threshold", "Minimum match score (0–100) for text-snippet search"),
+		("retro_review_hours", "Retro review window (hours)", "How long a staged /thread import waits for Finalize (1–168)"),
 	];
 
 	private DiscordInteractionResponseBuilder BuildGlobalsMenu(ulong guildId)
@@ -405,11 +409,16 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 			$"- Max attachment size: **{config.MaxAttachmentBytes(guildId)}** bytes\n" +
 			$"- Search depth: **{config.SearchDepth(guildId)}**\n" +
 			$"- Fuzzy threshold: **{config.FuzzyThreshold(guildId)}**\n" +
+			$"- Retroactive threading (/thread): **{(config.RetroEnabled(guildId) ? "on" : "off")}**\n" +
+			$"- Retro review window: **{config.RetroReviewHours(guildId)}** hours\n" +
 			$"- Debug masquerade users: {debug}\n\n" +
 			"Pick a setting to change:";
 
 		List<DiscordSelectComponentOption> options = GlobalSettings
 			.Select(s => new DiscordSelectComponentOption(s.Label, s.Key, s.Description))
+			.Append(new DiscordSelectComponentOption(
+				config.RetroEnabled(guildId) ? "Turn retroactive threading off" : "Turn retroactive threading on", "retro",
+				config.RetroEnabled(guildId) ? "Disables /thread at once and cancels imports in progress" : "Re-enables /thread and Thread from here"))
 			.Append(new DiscordSelectComponentOption("Debug masquerade users", "debug", "Who may use the ![name] impersonation prefix"))
 			.ToList();
 
@@ -418,10 +427,23 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 			.AddActionRowComponent(new DiscordSelectComponent("ttg:pick", "Pick a setting…", options));
 	}
 
-	private async Task HandleGlobalsComponentAsync(ComponentInteractionCreatedEventArgs e, string[] parts)
+	private async Task HandleGlobalsComponentAsync(DiscordClient client, ComponentInteractionCreatedEventArgs e, string[] parts)
 	{
 		switch (parts)
 		{
+			case ["ttg", "pick"] when e.Values[0] == "retro":
+			{
+				ulong guildId = e.Interaction.Guild!.Id;
+				bool nowEnabled = !config.RetroEnabled(guildId);
+				config.SetGlobal(guildId, "retro_enabled", nowEnabled ? "1" : "0");
+				// Respond first: cancelling sessions deletes threads (REST calls that
+				// could blow the 3-second ack window).
+				await UpdateAsync(e.Interaction, BuildGlobalsMenu(guildId));
+				if (!nowEnabled)
+					await retro.CancelAllForGuildAsync(client, guildId, "Retroactive threading was switched off for this server.");
+				return;
+			}
+
 			case ["ttg", "pick"] when e.Values[0] == "debug":
 			{
 				DiscordUserSelectComponent select = new("ttg:debug", "Select debug users…", minOptions: 1, maxOptions: 25);
@@ -444,6 +466,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 					"max_attachment_bytes" => config.MaxAttachmentBytes(e.Interaction.Guild!.Id).ToString(),
 					"search_depth" => config.SearchDepth(e.Interaction.Guild!.Id).ToString(),
 					"fuzzy_threshold" => config.FuzzyThreshold(e.Interaction.Guild!.Id).ToString(),
+					"retro_review_hours" => config.RetroReviewHours(e.Interaction.Guild!.Id).ToString(),
 					_ => "?",
 				};
 				DiscordModalBuilder modal = new DiscordModalBuilder()
@@ -476,7 +499,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 				config.SetGlobal(guildId, key, bytes.ToString());
 				return null;
 
-			case "orphan_timeout_minutes" or "thread_name_max_length" or "search_depth" or "fuzzy_threshold":
+			case "orphan_timeout_minutes" or "thread_name_max_length" or "search_depth" or "fuzzy_threshold" or "retro_review_hours":
 			{
 				(int min, int max) = key switch
 				{
@@ -484,6 +507,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 					"thread_name_max_length" => (10, 95),
 					"search_depth" => (10, 1000),
 					"fuzzy_threshold" => (0, 100),
+					"retro_review_hours" => (1, 168),
 					_ => (0, 0),
 				};
 				if (!int.TryParse(value, out int number) || number < min || number > max)

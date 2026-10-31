@@ -43,10 +43,12 @@ using Database db = new(Path.Combine(dataDir, "threadtender.db"));
 BotConfig config = BotConfig.Load(settingsPath, db);
 
 Transposer transposer = new(config, db);
-FlexThreader flex = new(config, db, transposer, dataDir);
+ThreadImporter importer = new(config, transposer, dataDir);
+FlexThreader flex = new(config, db, transposer, importer);
 OrphanManager orphans = new(config, db, transposer, flex, dataDir);
 MessageHandler messages = new(config, db, transposer, orphans, flex, dataDir);
-SetupCommands setup = new(config, db, orphans, flex);
+RetroThreader retro = new(config, db, importer, transposer);
+SetupCommands setup = new(config, db, orphans, flex, retro);
 
 bool recovered = false;
 
@@ -56,16 +58,26 @@ DiscordClientBuilder builder = DiscordClientBuilder
 		.HandleMessageCreated(messages.OnMessageCreatedAsync)
 		.HandleComponentInteractionCreated(async (client, e) =>
 		{
-			// Both handlers filter by custom-ID prefix (tt: orphan prompts; ttb/tte/ttu/ttg: setup).
+			// Each handler filters by custom-ID prefix (tt: orphan prompts; ttb/tte/ttu/ttg:
+			// setup; ttr: retroactive threading).
 			await orphans.HandleComponentAsync(client, e);
 			await setup.HandleComponentAsync(client, e);
+			await retro.HandleComponentAsync(client, e);
 		})
 		.HandleModalSubmitted(async (client, e) =>
 		{
 			await orphans.HandleModalAsync(client, e);
 			await setup.HandleModalAsync(client, e);
+			await retro.HandleModalAsync(client, e);
 		})
-		.HandleInteractionCreated(setup.HandleInteractionAsync)
+		.HandleInteractionCreated(async (client, e) =>
+		{
+			// Each filters by command name.
+			await setup.HandleInteractionAsync(client, e);
+			await retro.HandleInteractionAsync(client, e);
+		})
+		.HandleMessageReactionAdded(retro.HandleReactionAddedAsync)
+		.HandleMessageDeleted(retro.HandleMessageDeletedAsync)
 		// Joining a new server mid-run registers the setup commands immediately —
 		// otherwise they wouldn't appear there until the next restart.
 		.HandleGuildCreated(async (client, e) => await setup.RegisterGuildAsync(e.Guild))
@@ -77,6 +89,7 @@ DiscordClientBuilder builder = DiscordClientBuilder
 			{
 				recovered = true;
 				orphans.RecoverPending(client);
+				retro.Start(client); // resume interrupted imports + start the expiry sweep
 			}
 			await setup.RegisterAsync(client);
 

@@ -11,7 +11,7 @@ namespace ThreadTender;
 /// graph into an auto-created thread (oldest first, repost-before-delete per message).
 /// After the sweep the post behaves like Pure-Thread-Enforcement.
 /// </summary>
-public class FlexThreader(BotConfig config, Database db, Transposer transposer, string dataDir)
+public class FlexThreader(BotConfig config, Database db, Transposer transposer, ThreadImporter importer)
 {
 	private readonly ConcurrentDictionary<ulong, SemaphoreSlim> rootLocks = new();
 
@@ -187,102 +187,39 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 				continue;
 			}
 
-			DiscordMessage message;
-			try
-			{
-				// skipCache: the cached copy is a snapshot from when the message arrived —
-				// reactions added (and edits made) since then only exist on the REST copy.
-				message = await channel.GetMessageAsync(edge.MessageId, skipCache: true);
-			}
-			catch (NotFoundException)
+			// skipCache: the cached copy is a snapshot from when the message arrived —
+			// reactions added (and edits made) since then only exist on the REST copy.
+			DiscordMessage? message = await ThreadImporter.FetchFreshAsync(channel, edge.MessageId);
+			if (message is null)
 			{
 				db.DeleteGraphEdge(edge.MessageId); // deleted out from under us; nothing to move
 				continue;
 			}
 
-			// Pseudo-reply headers, bot-relay "@user:" lines, and (for debug users)
-			// masquerade prefixes were part of the in-channel presentation; none of them
-			// belong in the swept copy — the repost re-adds its own presentation.
-			string? contentOverride = Transposer.StripReplyHeader(message.Content);
-			contentOverride = Transposer.StripAuthorTag(contentOverride, edge.AuthorId, edge.AuthorName);
-			if (message.Author is not null && config.IsDebugUser(channel.GuildId ?? 0, message.Author.Id))
-				contentOverride = Masquerade.StripPrefix(contentOverride);
+			// Same invariant as everywhere else: repost first, delete only once the copy
+			// exists. A crash mid-sweep leaves the mapping unset, so the next comment's
+			// RecordCommentAsync re-runs the sweep and moves the remainder. Links to the
+			// root itself are omitted — sequential flow in the thread already implies them.
+			ulong? parentId = ThreadImporter.ParentOf(message);
+			string? replyHeader = parentId is { } pid && pid != root.Id && copies.TryGetValue(pid, out DiscordMessage? parentCopy)
+				? Transposer.ReplyHeaderFor(parentCopy)
+				: null;
 
-			string tempDir = Path.Combine(dataDir, "temp", edge.MessageId.ToString());
-			MovableContent content = await MovableContent.CaptureAsync(message, tempDir, config.MaxAttachmentBytes(channel.GuildId ?? 0),
-				edge.AuthorId, edge.AuthorName.Length > 0 ? edge.AuthorName : null,
-				contentOverride);
-			try
-			{
-				// Same invariant as everywhere else: repost first, delete only once the
-				// copy exists. A crash mid-sweep leaves the mapping unset, so the next
-				// comment's RecordCommentAsync re-runs the sweep and moves the remainder.
-				// Reply linkage: a real reply carries a reference; a pseudo-reply carries
-				// its target in the header line (parsed from the RAW content, before the
-				// header is stripped above). Links to the root itself are omitted —
-				// sequential flow in the thread already implies them.
-				ulong? parentId = Transposer.ParseReplyHeaderTarget(message.Content) ?? message.Reference?.Message?.Id;
-				string? replyHeader = parentId is { } pid && pid != root.Id && copies.TryGetValue(pid, out DiscordMessage? parentCopy)
-					? Transposer.ReplyHeaderFor(parentCopy)
-					: null;
+			// The sweep re-presents a conversation that already happened, so webhook
+			// impersonation keeps it reading naturally; live transpositions elsewhere use
+			// the bot relay instead.
+			DiscordMessage copy = await importer.CopyAsync(client, thread, message, edge.AuthorId, edge.AuthorName, replyHeader, recordMapping: true);
+			copies[edge.MessageId] = copy;
+			await ThreadImporter.EchoReactionsAsync(message, copy);
 
-				// The sweep re-presents a conversation that already happened, so webhook
-				// impersonation keeps it reading naturally; live transpositions elsewhere
-				// use the bot relay instead.
-				DiscordMessage copy = await transposer.RepostAsync(client, thread, content, edge.MessageId, RepostStyle.Webhook, replyHeader);
-				copies[edge.MessageId] = copy;
-
-				// Reactions can't be transposed, but the bot can echo each emoji on the
-				// copy — an invitation for people to re-react. Decoration only: a failed
-				// echo never aborts the sweep, but it IS logged (reaction rate limits are
-				// a special, easily-fumbled bucket) rather than swallowed silently.
-				if (message.Reactions is { Count: > 0 })
-				{
-					Console.WriteLine(
-						$"[ThreadTender] Echoing {message.Reactions.Count} reaction(s) from {edge.MessageId}: " +
-						string.Join(" ", message.Reactions.Select(r => r.Emoji.ToString())));
-					foreach (DiscordReaction reaction in message.Reactions)
-					{
-						try
-						{
-							await copy.CreateReactionAsync(reaction.Emoji);
-						}
-						catch (Exception ex)
-						{
-							Console.WriteLine($"[ThreadTender] Reaction echo {reaction.Emoji} failed on copy {copy.Id}: {ex.GetType().Name}: {ex.Message}");
-						}
-						// Discord's reaction rate limit is ~1 per 300ms per channel and uses
-						// its own bucket; explicit spacing keeps echoes from tripping 429s.
-						await Task.Delay(325);
-					}
-				}
-
-				try { await message.DeleteAsync("ThreadTender: reply graph moved to thread"); }
-				catch (NotFoundException) { }
-				db.DeleteGraphEdge(edge.MessageId);
-				if (!movedAuthors.Any(a => a.Id == edge.AuthorId))
-					movedAuthors.Add((edge.AuthorId, edge.AuthorName.Length > 0 ? edge.AuthorName : null));
-			}
-			finally
-			{
-				content.DeleteFiles();
-				if (Directory.Exists(tempDir))
-				{
-					try { Directory.Delete(tempDir, recursive: true); } catch (IOException) { }
-				}
-			}
+			try { await message.DeleteAsync("ThreadTender: reply graph moved to thread"); }
+			catch (NotFoundException) { }
+			db.DeleteGraphEdge(edge.MessageId);
+			if (!movedAuthors.Any(a => a.Id == edge.AuthorId))
+				movedAuthors.Add((edge.AuthorId, edge.AuthorName.Length > 0 ? edge.AuthorName : null));
 		}
 
 		db.SetFlexThread(root.Id, thread.Id);
-
-		if (movedAuthors.Count > 0)
-		{
-			// One mass ping so everyone whose messages just moved knows where the
-			// conversation went; synthetic debug identities render as plain text.
-			string tags = string.Join(" ", movedAuthors.Select(a => a.Name is not null ? $"**{a.Name}**" : $"<@{a.Id}>"));
-			await thread.SendMessageAsync(new DiscordMessageBuilder()
-				.WithContent($"{tags} — created discussion thread")
-				.WithAllowedMentions(movedAuthors.Where(a => a.Name is null).Select(a => (IMention)new UserMention(a.Id)).ToList()));
-		}
+		await ThreadImporter.PingMovedAuthorsAsync(thread, movedAuthors);
 	}
 }

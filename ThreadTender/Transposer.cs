@@ -102,7 +102,16 @@ public class Transposer(BotConfig config, Database db)
 	/// impersonation) and records the mapping.
 	/// </summary>
 	/// <returns>The first message of the reposted copy (callers may decorate it, e.g. reaction echoes).</returns>
-	public async Task<DiscordMessage> RepostAsync(DiscordClient client, DiscordThreadChannel thread, MovableContent content, ulong originalMessageId, RepostStyle style, string? replyHeader = null)
+	/// <param name="recordMapping">
+	/// Whether to record original → thread in the transposed table (used to route later
+	/// replies and to dedupe replayed events). Retroactive threading passes false: its
+	/// originals stay in the channel until Finalize and may never move at all.
+	/// </param>
+	/// <param name="extraPartIds">
+	/// When given (webhook style only), receives the IDs of every chunk after the first,
+	/// so callers that later delete or edit a copy can reach all of it.
+	/// </param>
+	public async Task<DiscordMessage> RepostAsync(DiscordClient client, DiscordThreadChannel thread, MovableContent content, ulong originalMessageId, RepostStyle style, string? replyHeader = null, bool recordMapping = true, List<ulong>? extraPartIds = null)
 	{
 		// Callers can arrive here with a mapped thread that bypassed GetOrCreateThreadAsync,
 		// and webhooks cannot post into archived threads — so unarchive defensively.
@@ -114,7 +123,8 @@ public class Transposer(BotConfig config, Database db)
 		if (style == RepostStyle.Bot)
 		{
 			DiscordMessage botFirst = await SendAsBotAsync(b => thread.SendMessageAsync(b), content, header: replyHeader);
-			db.RecordTransposed(originalMessageId, thread.Id);
+			if (recordMapping)
+				db.RecordTransposed(originalMessageId, thread.Id);
 			return botFirst;
 		}
 
@@ -139,11 +149,7 @@ public class Transposer(BotConfig config, Database db)
 			}
 		}
 
-		string text = content.Content;
-		if (content.Notes.Length > 0)
-			text = text.Length > 0 ? $"{text}\n{content.Notes}" : content.Notes;
-		if (replyHeader is not null)
-			text = text.Length > 0 ? $"{replyHeader}\n{text}" : replyHeader;
+		string text = CopyText(content.Content, content.Notes, replyHeader);
 
 		// Forwards and notes can push past Discord's 2000-char cap; chunk if needed.
 		List<string> chunks = Chunk(text, 2000);
@@ -188,10 +194,41 @@ public class Transposer(BotConfig config, Database db)
 		}
 
 		foreach (string chunk in chunks.Skip(1))
-			await ExecuteResilientAsync(NewBuilder().WithContent(chunk));
+		{
+			DiscordMessage part = await ExecuteResilientAsync(NewBuilder().WithContent(chunk));
+			extraPartIds?.Add(part.Id);
+		}
 
-		db.RecordTransposed(originalMessageId, thread.Id);
+		if (recordMapping)
+			db.RecordTransposed(originalMessageId, thread.Id);
 		return first;
+	}
+
+	/// <summary>
+	/// Edits a webhook copy in a thread to new text (retroactive threading's edit
+	/// reconciliation). Only single-message copies are edited; returns false when the
+	/// new text would need chunking, leaving the copy as it was.
+	/// </summary>
+	public async Task<bool> EditWebhookCopyAsync(DiscordClient client, DiscordThreadChannel thread, ulong copyId, string text)
+	{
+		if (text.Length == 0 || text.Length > 2000)
+			return false;
+		DiscordChannel parent = await client.GetChannelAsync(thread.ParentId
+			?? throw new InvalidOperationException($"Thread {thread.Id} has no parent"));
+		DiscordWebhook webhook = await GetOrCreateWebhookAsync(parent);
+		await webhook.EditMessageAsync(copyId, new DiscordWebhookBuilder().WithContent(text).WithThreadId(thread.Id));
+		return true;
+	}
+
+	/// <summary>The text a webhook copy carries: optional reply header, content, then notes.</summary>
+	public static string CopyText(string content, string notes, string? replyHeader)
+	{
+		string text = content;
+		if (notes.Length > 0)
+			text = text.Length > 0 ? $"{text}\n{notes}" : notes;
+		if (replyHeader is not null)
+			text = text.Length > 0 ? $"{replyHeader}\n{text}" : replyHeader;
+		return text;
 	}
 
 	/// <summary>
@@ -334,6 +371,10 @@ public class Transposer(BotConfig config, Database db)
 
 	/// <summary>The subtext header a pseudo-reply carries in place of a real reply reference.</summary>
 	public static string ReplyHeaderFor(DiscordMessage target) => $"-# ↪ in reply to {target.JumpLink}";
+
+	/// <summary>The same header built from IDs, for callers holding a stored copy ID rather than a message.</summary>
+	public static string ReplyHeaderFor(ulong guildId, ulong channelId, ulong messageId) =>
+		$"-# ↪ in reply to https://discord.com/channels/{guildId}/{channelId}/{messageId}";
 
 	/// <summary>
 	/// Extracts the target message ID from a pseudo-reply header line, if present — the

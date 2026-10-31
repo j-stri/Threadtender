@@ -98,6 +98,12 @@ public class BotConfig
 	public int SearchDepth(ulong guildId) => GetInt(guildId, "search_depth", 100);
 	public int FuzzyThreshold(ulong guildId) => GetInt(guildId, "fuzzy_threshold", 70);
 
+	/// <summary>Per-server off switch for retroactive threading (on unless explicitly set to "0").</summary>
+	public bool RetroEnabled(ulong guildId) => GetString(guildId, "retro_enabled") != "0";
+
+	/// <summary>How long a staged retroactive thread waits for Finalize before it is cancelled.</summary>
+	public int RetroReviewHours(ulong guildId) => GetInt(guildId, "retro_review_hours", 24);
+
 	public IReadOnlyList<ulong> DebugImpersonationUserIds(ulong guildId) =>
 		(GetString(guildId, "debug_impersonation_user_ids") ?? "")
 			.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

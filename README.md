@@ -69,6 +69,36 @@ Content that bots cannot re-send — stickers, polls — is noted inline as omit
 Messages already transposed are remembered (SQLite), so a reply aimed at a moved message
 still routes to the right thread.
 
+### Retroactive threading (any unbound channel)
+
+When a conversation in an ordinary channel should have been a thread, anyone can pull
+it into one after the fact: right-click the message that started it and choose
+**Apps → Thread from here**, or run **/thread** and pick that message from a list.
+
+1. Name the thread (prefilled from the first message when you right-clicked it).
+2. Every human message after it (up to 100) is listed, all ticked. Untick the
+   unrelated chatter and press **Stage thread**.
+3. The bot creates the thread on that first message and posts webhook copies of the
+   ticked messages, in order and under their authors' names, with reply chains
+   recreated as link headers. (If the first message already has a thread, the import
+   gets its own standalone thread instead, opened by a copy of that message.)
+4. **Review:** anyone can react ❌ on a copy to drop it — the copy disappears and its
+   original stays in the channel. ✅ just marks a copy as checked. Once every copy has
+   been looked at, a **"Does this look good?"** message appears.
+5. **Finalize** (from that message, or **Finalize now** on the thread's header) deletes
+   the kept originals from the channel, swaps the review reactions for an echo of each
+   original's reactions, and pings the moved authors once. **Nothing leaves the
+   channel before Finalize** — Cancel, or the review window running out (24 hours by
+   default), deletes the staging thread and leaves the channel exactly as it was.
+
+Finalize double-checks everything before deleting: a copy whose original its author
+deleted is removed too; a message edited during review has its copy updated (or, if
+that isn't possible, stays in the channel); and a message whose attachments couldn't
+all be re-uploaded stays in the channel alongside its copy, so no file is lost. Every
+step resumes safely after a restart. It's refused in bound channels (their binding
+already decides where discussion goes), and can be switched off per server in
+**/botsettings** — switching it off cancels any import in progress.
+
 ## Setup
 
 ### 1. Discord application
@@ -118,7 +148,10 @@ no config is found anywhere, a first run writes a sample and prints its full pat
 The token may instead be supplied via the `DISCORD_TOKEN` environment variable, which
 takes precedence.
 
-### 3. Slash commands (requires Manage Server)
+### 3. Slash commands
+
+**/thread** and the **Thread from here** context menu (retroactive threading, above)
+are open to everyone. The rest require Manage Server:
 
 - **/bind** — setup wizard: pick a channel, pick a mode (each explained in the menu),
   pick the whitelisted author(s). Running it on an already-bound channel drops you into
@@ -128,11 +161,13 @@ takes precedence.
   that channel are cancelled and their content returned to the authors; existing
   threads and moved messages stay where they are.
 - **/botsettings** — view and edit this server's settings: orphan timeout, thread name
-  max length, max attachment size, search depth, fuzzy threshold, and the debug
-  masquerade user list. All of these are **per-server** — servers sharing the bot never
+  max length, max attachment size, search depth, fuzzy threshold, the retroactive
+  threading on/off switch and review window, and the debug masquerade user list. All of these are **per-server** — servers sharing the bot never
   see each other's configuration.
 
-All command flows are ephemeral — no channel clutter. Commands are registered per
+All command flows are ephemeral — no channel clutter. Retroactive threading also needs
+the bot's usual permissions in whichever channel it's used — grant them at the role
+level, not just in bound channels; the command names anything missing. Commands are registered per
 guild on startup, so they appear as soon as the bot connects.
 
 ### Debug masquerade
