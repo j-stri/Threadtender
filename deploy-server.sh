@@ -22,10 +22,17 @@ dotnet publish ThreadTender/ThreadTender.csproj -c Release -o bin/publish
 # State (SQLite DB, held attachments) lives in ./data, set via DATA_DIR in the
 # unit. The token comes from ./.env as DISCORD_TOKEN. Both are gitignored, so
 # 'git reset --hard' leaves them alone.
+# The bot refuses to start without a settings.json, even when DISCORD_TOKEN is
+# set, so seed a placeholder (the env var overrides its token).
 mkdir -p data
+[ -f data/settings.json ] || cp settings.example.json data/settings.json
 
 systemctl --user daemon-reload
-systemctl --user restart threadtender.service
+if grep -qE '^DISCORD_TOKEN=.+' .env 2>/dev/null; then
+  systemctl --user restart threadtender.service
+else
+  echo "No DISCORD_TOKEN in .env yet: built, but not (re)starting the service."
+fi
 
 # Server-only extras (gitignored): put more commands in deploy-server.local.sh.
 if [ -f deploy-server.local.sh ]; then
