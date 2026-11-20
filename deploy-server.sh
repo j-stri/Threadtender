@@ -17,7 +17,9 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 
 git reset --hard
 rm -rf bin/publish
-dotnet publish ThreadTender/ThreadTender.csproj -c Release -o bin/publish
+# --disable-build-servers: otherwise a lingering compiler server keeps the
+# post-receive hook's output open and `git push` hangs until it idles out.
+dotnet publish ThreadTender/ThreadTender.csproj -c Release -o bin/publish --disable-build-servers
 
 # State (SQLite DB, held attachments) lives in ./data, set via DATA_DIR in the
 # unit. The token comes from ./.env as DISCORD_TOKEN. Both are gitignored, so
