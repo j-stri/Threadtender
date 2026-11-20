@@ -1,0 +1,16 @@
+# Copy to ~/.config/systemd/user/threadtender.service on tharmas.
+[Unit]
+Description=ThreadTender Discord bot
+After=network-online.target
+
+[Service]
+ExecStart=/run/current-system/sw/bin/nix shell nixpkgs#dotnet-runtime_10 --command dotnet bin/publish/ThreadTender.dll
+WorkingDirectory=%h/threadtender
+Environment=DATA_DIR=%h/threadtender/data
+Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1
+EnvironmentFile=%h/threadtender/.env
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

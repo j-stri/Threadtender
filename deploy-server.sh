@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Deploy on the server (tharmas): run from inside ~/threadtender after a push.
+# (The post-receive hook does this automatically when main is pushed.)
+# Same shape as cardlog's: sync the working tree, do a clean build, restart the
+# user service.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# NixOS: no system dotnet, and anything installed imperatively gets garbage
+# collected. If dotnet is missing, re-run this script inside an ephemeral nix
+# shell that has the .NET 10 SDK.
+if ! command -v dotnet >/dev/null 2>&1; then
+  echo "dotnet not found, re-running inside nix shell (nixpkgs#dotnet-sdk_10)..."
+  exec nix shell nixpkgs#dotnet-sdk_10 --command bash "$0" "$@"
+fi
+export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+
+git reset --hard
+rm -rf bin/publish
+dotnet publish ThreadTender/ThreadTender.csproj -c Release -o bin/publish
+
+# State (SQLite DB, held attachments) lives in ./data, set via DATA_DIR in the
+# unit. The token comes from ./.env as DISCORD_TOKEN. Both are gitignored, so
+# 'git reset --hard' leaves them alone.
+mkdir -p data
+
+systemctl --user daemon-reload
+systemctl --user restart threadtender.service
+
+# Server-only extras (gitignored): put more commands in deploy-server.local.sh.
+if [ -f deploy-server.local.sh ]; then
+  echo "Running deploy-server.local.sh..."
+  bash deploy-server.local.sh
+fi
+
+echo "Deployed $(git rev-parse --short HEAD): $(git log -1 --format=%s)"

@@ -4,3 +4,5 @@ data/
 *.user
 .idea/
 settings.json
+.env
+deploy-server.local.sh

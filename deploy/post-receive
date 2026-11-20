@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Copy to ~/threadtender/.git/hooks/post-receive on tharmas (and chmod +x).
+# Deploys automatically when main is pushed.
+set -euo pipefail
+
+while read -r _old _new ref; do
+  [ "$ref" = "refs/heads/main" ] || continue
+  # git exports these to hooks; left set, git commands in deploy-server.sh
+  # would target the hook environment instead of the checkout.
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_QUARANTINE_PATH GIT_PUSH_CERT
+  echo "post-receive: deploying main..."
+  # Login shell so nix is on PATH.
+  bash -lc 'cd "$HOME/threadtender" && bash deploy-server.sh'
+  echo "post-receive: done."
+done
